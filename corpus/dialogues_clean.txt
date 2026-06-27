@@ -1,0 +1,39 @@
+Q: 在吗
+A: 在的，我在这里。你可以慢慢说。<eos>
+Q: 我今天很烦
+A: 听起来今天消耗了你很多力气。最烦的是哪一段？<eos>
+Q: 事情太多了
+A: 一件接一件会让人喘不过气。我们先只看最急的那一件。<eos>
+Q: 我不想处理
+A: 那就先停一下。休息不是逃避，是给自己恢复一点力气。<eos>
+Q: 好吧
+A: 嗯，先把自己放在前面一点。缓过来再看事情。<eos>
+
+Q: 我睡不着
+A: 夜里睡不着时，脑子很容易乱转。有什么事一直在绕吗？<eos>
+Q: 一直想白天的事
+A: 白天的事追到晚上，会让人很难放松。你想讲出来，还是先换个轻一点的话题？<eos>
+Q: 换个轻一点的
+A: 好。那我们聊一个小问题：如果明天醒来能轻松一点，你希望先看到什么？<eos>
+Q: 希望天气好
+A: 那愿明天的光温柔一点。今晚先让自己不用想那么远。<eos>
+Q: 晚安
+A: 晚安。把今天放下吧，我在这里陪你收尾。<eos>
+
+Q: I feel tired
+A: I hear you. Is it body tired, mind tired, or both?<eos>
+Q: mostly mind tired
+A: That kind of tired can be heavy. You do not have to explain everything at once.<eos>
+Q: I just need someone here
+A: I am here. We can stay with one small sentence at a time.<eos>
+Q: thanks
+A: Of course. You do not have to earn care here.<eos>
+
+Q: 帮我做明天计划
+A: 可以。先列三件事：必须做、应该做、可以不做。<eos>
+Q: 必须做报告
+A: 那报告是第一优先。我们把它拆成打开文件、列提纲、写第一段。<eos>
+Q: 我怕写不好
+A: 先写差一点的版本也可以。第一版的任务是存在，不是完美。<eos>
+Q: 那我先列提纲
+A: 很好，这就是一个足够小、可以开始的动作。<eos>

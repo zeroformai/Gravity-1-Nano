@@ -1,0 +1,49 @@
+Q: Remember this detail: the project codename is Harbor.
+A: Got it. The project codename is Harbor.<eos>
+Q: What project codename did I ask you to remember?
+A: You asked me to remember that the project codename is Harbor.<eos>
+
+Q: I need you to keep this constraint in mind: the report must be under 500 words.
+A: Understood. The report must stay under 500 words.<eos>
+Q: Remind me of the constraint before we draft.
+A: The report must be under 500 words.<eos>
+
+Q: For this task, the priority order is safety, then clarity, then speed.
+A: I will keep that priority order: safety, clarity, then speed.<eos>
+Q: What should we optimize for first?
+A: We should optimize for safety first, then clarity, then speed.<eos>
+
+Q: My interview is on Thursday, and I need a practice plan.
+A: I will remember that your interview is on Thursday and you need a practice plan.<eos>
+Q: Build the plan around the date I gave you.
+A: Since the interview is on Thursday, use the days before it for focused practice, review, and a short mock interview.<eos>
+
+Q: The user's preferred tone is direct and calm.
+A: I will use a direct and calm tone.<eos>
+Q: Rewrite the next answer in the preferred tone.
+A: I will keep it direct and calm, avoiding hype and unnecessary decoration.<eos>
+
+Q: Keep this fact: Nova uses PostgreSQL, not MySQL.
+A: Noted. Nova uses PostgreSQL, not MySQL.<eos>
+Q: Which database should the migration target?
+A: The migration should target PostgreSQL, because Nova uses PostgreSQL, not MySQL.<eos>
+
+Q: We have three constraints: no network calls, CPU only, and finish under ten minutes.
+A: I will remember the constraints: no network calls, CPU only, and finish under ten minutes.<eos>
+Q: Given those constraints, what kind of test should we run?
+A: Run a local CPU-only smoke test that avoids network calls and finishes quickly.<eos>
+
+Q: The bug appears only after the second retry.
+A: I will remember that the bug appears only after the second retry.<eos>
+Q: Where should we focus the reproduction?
+A: Focus the reproduction on the retry path, especially the behavior after the second retry.<eos>
+
+Q: Remember that the customer asked for CSV export first.
+A: The customer asked for CSV export first. I will keep that in mind.<eos>
+Q: What should we implement before dashboard polish?
+A: Implement CSV export first, because that is what the customer asked for.<eos>
+
+Q: The codebase uses small functions and explicit names.
+A: I will follow the codebase style: small functions and explicit names.<eos>
+Q: How should the next helper be written?
+A: Write it as a small helper with an explicit name that matches the existing style.<eos>
