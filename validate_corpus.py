@@ -1,17 +1,84 @@
 """
 Validate Gravity corpus files before training.
+
+This script intentionally avoids importing torch-backed training utilities so
+corpus checks can run in a lightweight text-only environment.
 """
 
 from __future__ import annotations
 
 import argparse
+import glob
+import re
 from pathlib import Path
 
 from tokenizer import EOS_TOKEN
-from utils import load_text_files, parse_qa_conversations, parse_qa_examples
 
 
-MOJIBAKE_MARKERS = ("�", "鎴", "浣", "鐨", "鍦", "涓", "绱", "銆", "锛", "紵", "€")
+MOJIBAKE_MARKERS = (
+    "\ufffd",
+    "锟",
+    "閹",
+    "娴",
+    "閻",
+    "閸",
+    "娑",
+    "缁",
+    "閵",
+    "閿",
+    "鈧",
+)
+
+
+def load_text_files(spec: str) -> list[tuple[str, str]]:
+    paths: list[str] = []
+    for part in re.split(r"[,;]", spec or ""):
+        pattern = part.strip()
+        if not pattern:
+            continue
+        matches = sorted(glob.glob(pattern))
+        paths.extend(matches or [pattern])
+
+    if not paths:
+        raise ValueError("No input files were specified.")
+
+    loaded: list[tuple[str, str]] = []
+    for path in paths:
+        file_path = Path(path)
+        if not file_path.exists():
+            raise FileNotFoundError(path)
+        text = file_path.read_text(encoding="utf-8")
+        print(f"[Corpus] Loaded {len(text):,} characters from '{path}'.")
+        loaded.append((str(file_path), text))
+    return loaded
+
+
+def parse_qa_examples(text: str) -> list[tuple[str, str]]:
+    if not text.strip():
+        raise ValueError("Dataset is empty.")
+
+    pattern = re.compile(r"^Q: (.*?)\nA: (.*?)(?:<eos>)(?:\r?\n|$)", re.MULTILINE | re.DOTALL)
+    examples = [(q.strip(), a.strip()) for q, a in pattern.findall(text)]
+    if not examples:
+        raise ValueError("No Q/A examples found. Expected records ending with <eos>.")
+
+    q_count = len(re.findall(r"^Q: ", text, flags=re.MULTILINE))
+    eos_count = text.count(EOS_TOKEN)
+    if len(examples) != q_count or len(examples) != eos_count:
+        raise ValueError(
+            "Malformed Q/A dataset: every 'Q:' record must have an 'A:' answer "
+            f"ending with {EOS_TOKEN}. Parsed {len(examples)} examples, found "
+            f"{q_count} questions and {eos_count} EOS markers."
+        )
+    return examples
+
+
+def parse_qa_conversations(text: str) -> list[list[tuple[str, str]]]:
+    conversations: list[list[tuple[str, str]]] = []
+    for chunk in re.split(r"(?:\r?\n){2,}", text.strip()):
+        if chunk.strip():
+            conversations.append(parse_qa_examples(chunk + "\n"))
+    return conversations
 
 
 def count_lines(path: str) -> int:
@@ -45,10 +112,10 @@ def main() -> None:
         total_lines += lines
         total_examples += len(examples)
         marker_count += suspect_mojibake(text)
-        for example in examples:
-            if example.question in seen_questions:
+        for question, _ in examples:
+            if question in seen_questions:
                 duplicate_questions += 1
-            seen_questions.add(example.question)
+            seen_questions.add(question)
         if text.count(EOS_TOKEN) != len(examples):
             raise ValueError(f"EOS count mismatch in {path}")
         print(f"[Corpus] {path}: {lines:,} lines | {len(examples):,} Q/A records")

@@ -55,8 +55,10 @@ pass when no API key is available.
 After supervised training and DPO, use the lightweight RL loop to improve
 problem-solving behavior from the model's own sampled answers. The script
 scores each rollout with a task reward based on target-answer overlap,
-actionability, length, and quality gates, while a frozen reference checkpoint
-keeps the policy from drifting too far in one run.
+actionability, length, and quality gates. The update uses several sampled
+answers per prompt, group-normalized advantages, PPO-style ratio clipping, and
+a frozen reference checkpoint to keep the policy from drifting too far in one
+run.
 
 Smoke-test the setup first:
 
@@ -67,7 +69,7 @@ python train_rl.py --checkpoint checkpoints_dpo_casual_step8_final/model.pt --to
 Run a small RL pass:
 
 ```bash
-python train_rl.py --checkpoint checkpoints_dpo_casual_step8_final/model.pt --tokenizer checkpoints_dpo_casual_step8_final/tokenizer.json --checkpoint_dir checkpoints_rl_step1 --max_examples 1000 --max_iters 50 --batch_size 2 --learning_rate 2e-6 --kl_coef 0.03 --device cuda
+python train_rl.py --checkpoint checkpoints_dpo_casual_step8_final/model.pt --tokenizer checkpoints_dpo_casual_step8_final/tokenizer.json --checkpoint_dir checkpoints_rl_step1 --max_examples 1000 --max_iters 50 --batch_size 2 --rollouts_per_prompt 2 --learning_rate 2e-6 --kl_coef 0.03 --ppo_clip 0.2 --device cuda
 ```
 
 Then evaluate `checkpoints_rl_step1` with `eval_prompts.py` and keep iterating in

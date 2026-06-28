@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import re
 import sys
 import time
@@ -480,7 +481,7 @@ def generate(
     top_p: float | None = 0.85,
     device: torch.device = torch.device("cpu"),
     stop_on_eos: bool = True,
-    suppress_bad_tokens: bool = False,
+    suppress_bad_tokens: bool = True,
     repetition_penalty: float = 1.08,
 ) -> tuple[str, int, float, float]:
     model.eval()
@@ -590,6 +591,16 @@ def extract_answer(prompt: str, generated: str) -> str:
 
 
 def load_model(checkpoint_path: str, tokenizer_path: str, device: torch.device) -> tuple[MiniGPT, object]:
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(
+            f"Checkpoint not found: {checkpoint_path}. Train a model first or pass "
+            "--checkpoint pointing at a directory that contains model.pt."
+        )
+    if not os.path.exists(tokenizer_path):
+        raise FileNotFoundError(
+            f"Tokenizer not found: {tokenizer_path}. Pass --tokenizer pointing at "
+            "the tokenizer.json saved beside the checkpoint."
+        )
     tokenizer = load_tokenizer(tokenizer_path)
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
     cfg = checkpoint["config"]
@@ -624,7 +635,7 @@ def answer_question(
     top_k: int | None,
     top_p: float | None,
     device: torch.device,
-    suppress_bad_tokens: bool = False,
+    suppress_bad_tokens: bool = True,
     fallback_corpus: str | None = DEFAULT_FALLBACK_CORPUS,
     use_retrieval_fallback: bool = True,
     hallucination_entropy: float = 4.0,
@@ -698,7 +709,7 @@ def chat_loop(
     top_p: float | None,
     device: torch.device,
     max_history: int = 2,
-    suppress_bad_tokens: bool = False,
+    suppress_bad_tokens: bool = True,
     fallback_corpus: str | None = DEFAULT_FALLBACK_CORPUS,
     use_retrieval_fallback: bool = True,
     max_prompt_tokens: int | None = None,
@@ -759,10 +770,15 @@ def parse_args() -> argparse.Namespace:
         help="Token budget for prompt/history packing. Defaults to context minus generation budget.",
     )
     parser.add_argument("--chat", action="store_true", help="Start interactive Q/A mode")
-    parser.add_argument("--allow_bad_tokens", action="store_true", help="Deprecated alias")
+    parser.add_argument(
+        "--allow_bad_tokens",
+        action="store_true",
+        help="Disable invalid UTF-8 token masking for raw model debugging.",
+    )
     parser.add_argument(
         "--suppress_bad_tokens",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help="Mask tokens that decode to invalid UTF-8 by themselves.",
     )
     parser.add_argument(

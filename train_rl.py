@@ -43,6 +43,7 @@ class RLExample:
 
 @dataclass(frozen=True)
 class Rollout:
+    group_id: int
     prompt: str
     question: str
     target: str
@@ -63,6 +64,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_examples", type=int, default=2000)
     parser.add_argument("--seq_len", type=int, default=None)
     parser.add_argument("--batch_size", type=int, default=2)
+    parser.add_argument(
+        "--rollouts_per_prompt",
+        type=int,
+        default=2,
+        help="Sample this many answers for each prompt and normalize rewards within the prompt group.",
+    )
     parser.add_argument("--max_iters", type=int, default=50)
     parser.add_argument("--max_new_tokens", type=int, default=80)
     parser.add_argument("--learning_rate", type=float, default=2e-6)
@@ -72,6 +79,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--kl_coef", type=float, default=0.03)
     parser.add_argument("--reward_baseline", type=float, default=0.35)
     parser.add_argument("--advantage_clip", type=float, default=1.5)
+    parser.add_argument(
+        "--ppo_clip",
+        type=float,
+        default=0.2,
+        help="Clip policy probability ratios around the rollout policy, PPO-style.",
+    )
     parser.add_argument(
         "--allow_negative_only_updates",
         action="store_true",
@@ -100,16 +113,26 @@ def select_device(requested: str) -> torch.device:
 
 def load_rl_examples(data_spec: str, limit: int) -> list[RLExample]:
     examples: list[RLExample] = []
+    skipped = 0
     for _, text in load_text_files(data_spec):
         for item in parse_qa_examples(text):
-            if item.question.strip() and item.answer.strip():
-                examples.append(RLExample(item.question.strip(), item.answer.strip()))
+            question = item.question.strip()
+            answer = item.answer.strip()
+            if not question or not answer:
+                skipped += 1
+                continue
+            if has_bad_text(question) or has_bad_text(answer) or is_low_quality_answer(answer, question):
+                skipped += 1
+                continue
+            examples.append(RLExample(question, answer))
     if not examples:
         raise ValueError(f"No Q/A examples found in {data_spec}")
     random.shuffle(examples)
     if limit > 0:
         examples = examples[:limit]
     print(f"[RL] Loaded {len(examples):,} reward prompts.")
+    if skipped:
+        print(f"[RL] Skipped {skipped:,} low-quality reward prompts.")
     return examples
 
 
@@ -298,16 +321,35 @@ def rl_loss(
     reward_baseline: float,
     advantage_clip: float,
     kl_coef: float,
+    ppo_clip: float,
     use_amp: bool,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     x, y, mask, rewards = pad_rollouts(rollouts, pad_id, device)
+    with torch.no_grad():
+        old_logp = sequence_logps(policy_model, x, y, mask, use_amp)
     pi_logp = sequence_logps(policy_model, x, y, mask, use_amp)
     with torch.no_grad():
         ref_logp = sequence_logps(reference_model, x, y, mask, use_amp)
 
-    advantages = (rewards - reward_baseline).clamp(-advantage_clip, advantage_clip)
+    advantages = rewards - reward_baseline
+    group_ids = torch.tensor([item.group_id for item in rollouts], dtype=torch.long, device=device)
+    for group_id in group_ids.unique():
+        group_mask = group_ids == group_id
+        if int(group_mask.sum().item()) < 2:
+            continue
+        group_rewards = rewards[group_mask]
+        group_std = group_rewards.std(unbiased=False)
+        if float(group_std.item()) > 1e-6:
+            advantages[group_mask] = (group_rewards - group_rewards.mean()) / group_std
+        else:
+            advantages[group_mask] = group_rewards - reward_baseline
+    advantages = advantages.clamp(-advantage_clip, advantage_clip)
+
+    ratio = torch.exp((pi_logp - old_logp).clamp(-8.0, 8.0))
+    clipped_ratio = ratio.clamp(1.0 - ppo_clip, 1.0 + ppo_clip)
+    policy_objective = torch.minimum(ratio * advantages.detach(), clipped_ratio * advantages.detach())
     kl_delta = pi_logp - ref_logp
-    loss = -(advantages.detach() * pi_logp).mean() + kl_coef * kl_delta.pow(2).mean()
+    loss = -policy_objective.mean() + kl_coef * kl_delta.pow(2).mean()
     metrics = {
         "loss": float(loss.detach().item()),
         "reward": float(rewards.mean().item()),
@@ -315,6 +357,7 @@ def rl_loss(
         "kl_delta": float(kl_delta.detach().mean().item()),
         "policy_logp": float(pi_logp.detach().mean().item()),
         "ref_logp": float(ref_logp.detach().mean().item()),
+        "ratio": float(ratio.detach().mean().item()),
         "entropy": sum(item.entropy for item in rollouts) / len(rollouts),
     }
     return loss, metrics
@@ -365,7 +408,8 @@ def main() -> None:
 
     print(
         f"[RL] Starting online RL for {args.max_iters} steps | "
-        f"batch={args.batch_size} kl_coef={args.kl_coef}"
+        f"batch={args.batch_size} rollouts_per_prompt={args.rollouts_per_prompt} "
+        f"kl_coef={args.kl_coef} ppo_clip={args.ppo_clip}"
     )
     policy_model.train()
     skipped_updates = 0
@@ -376,23 +420,36 @@ def main() -> None:
 
         sampled = random.choices(examples, k=args.batch_size)
         rollouts: list[Rollout] = []
-        for example in sampled:
+        for group_id, example in enumerate(sampled):
             prompt = build_qa_prompt([], example.question)
-            answer, ids, mask, entropy = sample_answer(
-                policy_model,
-                tokenizer,
-                prompt,
-                args.max_new_tokens,
-                args.temperature,
-                args.top_k,
-                args.top_p,
-                device,
-            )
-            if len(ids) > seq_len:
-                ids = ids[:seq_len]
-                mask = mask[:max(0, seq_len - 1)]
-            reward = reward_answer(example.question, answer, example.target)
-            rollouts.append(Rollout(prompt, example.question, example.target, answer, ids, mask, reward, entropy))
+            for _ in range(max(1, args.rollouts_per_prompt)):
+                answer, ids, mask, entropy = sample_answer(
+                    policy_model,
+                    tokenizer,
+                    prompt,
+                    args.max_new_tokens,
+                    args.temperature,
+                    args.top_k,
+                    args.top_p,
+                    device,
+                )
+                if len(ids) > seq_len:
+                    ids = ids[:seq_len]
+                    mask = mask[:max(0, seq_len - 1)]
+                reward = reward_answer(example.question, answer, example.target)
+                rollouts.append(
+                    Rollout(
+                        group_id,
+                        prompt,
+                        example.question,
+                        example.target,
+                        answer,
+                        ids,
+                        mask,
+                        reward,
+                        entropy,
+                    )
+                )
 
         best_reward = max(item.reward for item in rollouts)
         skipped_update = False
@@ -407,6 +464,7 @@ def main() -> None:
                 "kl_delta": 0.0,
                 "policy_logp": 0.0,
                 "ref_logp": 0.0,
+                "ratio": 1.0,
                 "entropy": sum(item.entropy for item in rollouts) / len(rollouts),
             }
         else:
@@ -420,6 +478,7 @@ def main() -> None:
                 reward_baseline=args.reward_baseline,
                 advantage_clip=args.advantage_clip,
                 kl_coef=args.kl_coef,
+                ppo_clip=args.ppo_clip,
                 use_amp=use_amp,
             )
             scaler.scale(loss).backward()
@@ -433,7 +492,8 @@ def main() -> None:
                 f"[RL][train] step {step:>5d}/{args.max_iters} "
                 f"loss {metrics['loss']:.4f} reward {metrics['reward']:.3f} "
                 f"adv {metrics['advantage']:.3f} kl_delta {metrics['kl_delta']:.4f} "
-                f"pi_logp {metrics['policy_logp']:.4f} entropy {metrics['entropy']:.3f} "
+                f"ratio {metrics['ratio']:.3f} pi_logp {metrics['policy_logp']:.4f} "
+                f"entropy {metrics['entropy']:.3f} "
                 f"lr {lr:.2e}" + (" skipped_update" if skipped_update else ""),
                 flush=True,
             )
@@ -451,6 +511,8 @@ def main() -> None:
                 "rl_base_checkpoint": args.checkpoint,
                 "rl_kl_coef": args.kl_coef,
                 "rl_reward_baseline": args.reward_baseline,
+                "rl_rollouts_per_prompt": args.rollouts_per_prompt,
+                "rl_ppo_clip": args.ppo_clip,
                 "rl_skipped_updates": skipped_updates,
             },
         },
