@@ -11,6 +11,7 @@ gating, and an intent-aware fallback when the model is likely hallucinating.
 from __future__ import annotations
 
 import argparse
+import glob
 import math
 import os
 import re
@@ -18,25 +19,45 @@ import sys
 import time
 from dataclasses import dataclass
 
-import torch
+try:
+    import torch
+except ImportError as exc:
+    torch = None
+    _TORCH_IMPORT_ERROR = exc
+else:
+    _TORCH_IMPORT_ERROR = None
 
-from model import MiniGPT
+try:
+    from model import MiniGPT
+except ImportError as exc:
+    MiniGPT = object
+    _MODEL_IMPORT_ERROR = exc
+else:
+    _MODEL_IMPORT_ERROR = None
+
 from tokenizer import EOS_TOKEN, load_tokenizer
+
+
+def _inference_mode():
+    if torch is not None:
+        return torch.inference_mode()
+
+    def decorator(func):
+        return func
+
+    return decorator
 
 
 DEFAULT_FALLBACK_CORPUS = "corpus/priority_qa.txt;corpus/qa_10k.txt;corpus/dialogues_clean.txt"
 BAD_TEXT_MARKERS = (
     "\ufffd",
     "锟",
-    "閹",
-    "娴",
-    "閻",
-    "閸",
-    "閵",
     "閿",
-    "绱",
+    "闁",
+    "濞",
+    "缁",
+    "閳",
     "鈧",
-    "�",
 )
 EN_STOP_WORDS = {
     "a", "an", "and", "are", "be", "can", "do", "for", "how", "i", "is",
@@ -44,7 +65,8 @@ EN_STOP_WORDS = {
     "you", "your",
 }
 ZH_STOP_CHARS = set("的一是在了和就也都而及与或很我你他她它们这那有没不吗呢吧啊")
-_CORPUS_CACHE: dict[str, list[tuple[str, str]]] = {}
+_CORPUS_CACHE: dict[str, list["CorpusEntry"]] = {}
+_BAD_TOKEN_CACHE: dict[tuple[int, int], torch.Tensor] = {}
 
 
 @dataclass(frozen=True)
@@ -52,6 +74,22 @@ class RetrievalMatch:
     question: str
     answer: str
     score: float
+
+
+@dataclass(frozen=True)
+class CorpusEntry:
+    question: str
+    answer: str
+    normalized_question: str
+    features: frozenset[str]
+
+
+@dataclass(frozen=True)
+class AnswerResult:
+    answer: str
+    num_tokens: int
+    elapsed: float
+    source: str
 
 
 def configure_output_encoding() -> None:
@@ -131,7 +169,7 @@ def _features(text: str) -> set[str]:
     return feats
 
 
-def _load_corpus_examples(corpus_spec: str) -> list[tuple[str, str]]:
+def _load_corpus_examples(corpus_spec: str) -> list[CorpusEntry]:
     cached = _CORPUS_CACHE.get(corpus_spec)
     if cached is not None:
         return cached
@@ -146,14 +184,47 @@ def _load_corpus_examples(corpus_spec: str) -> list[tuple[str, str]]:
             for _, text in load_text_files(corpus_spec):
                 examples.extend((item.question, item.answer) for item in parse_qa_examples(text))
     except Exception:
-        examples = []
+        examples = _load_corpus_examples_lightweight(corpus_spec)
 
-    clean_examples = [
-        (q, a) for q, a in examples
-        if q.strip() and a.strip() and not has_bad_text(q) and not has_bad_text(a)
-    ]
+    clean_examples: list[CorpusEntry] = []
+    seen_questions: set[str] = set()
+    for question, answer in examples:
+        q = question.strip()
+        a = answer.strip()
+        normalized = _normalize_query(q)
+        if not q or not a or not normalized:
+            continue
+        if normalized in seen_questions or has_bad_text(q) or has_bad_text(a):
+            continue
+        feats = frozenset(_features(normalized))
+        clean_examples.append(CorpusEntry(q, a, normalized, feats))
+        seen_questions.add(normalized)
+
     _CORPUS_CACHE[corpus_spec] = clean_examples
     return clean_examples
+
+
+def _load_corpus_examples_lightweight(corpus_spec: str) -> list[tuple[str, str]]:
+    paths: list[str] = []
+    for part in re.split(r"[,;]", corpus_spec or ""):
+        pattern = part.strip()
+        if not pattern:
+            continue
+        matches = sorted(glob.glob(pattern))
+        paths.extend(matches or [pattern])
+
+    examples: list[tuple[str, str]] = []
+    pattern = re.compile(r"^Q: (.*?)\nA: (.*?)(?:<eos>)(?:\r?\n|$)", re.MULTILINE | re.DOTALL)
+    for path in paths:
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                text = f.read()
+        except OSError:
+            continue
+        examples.extend((q.strip(), a.strip()) for q, a in pattern.findall(text))
+    return examples
 
 
 def retrieve_ranked_answers(question: str, corpus_spec: str, limit: int = 3) -> list[RetrievalMatch]:
@@ -164,19 +235,17 @@ def retrieve_ranked_answers(question: str, corpus_spec: str, limit: int = 3) -> 
         return []
 
     matches: list[RetrievalMatch] = []
-    for candidate, answer in examples:
-        c_norm = _normalize_query(candidate)
-        if q_norm == c_norm:
-            matches.append(RetrievalMatch(candidate, answer, 2.0))
+    for entry in examples:
+        if q_norm == entry.normalized_question:
+            matches.append(RetrievalMatch(entry.question, entry.answer, 2.0))
             continue
-        c_feats = _features(c_norm)
-        if not c_feats:
+        if not entry.features:
             continue
-        score = len(q_feats & c_feats) / max(1, len(q_feats | c_feats))
-        if q_norm in c_norm or c_norm in q_norm:
+        score = len(q_feats & entry.features) / max(1, len(q_feats | entry.features))
+        if q_norm in entry.normalized_question or entry.normalized_question in q_norm:
             score += 0.35
         if score > 0:
-            matches.append(RetrievalMatch(candidate, answer, score))
+            matches.append(RetrievalMatch(entry.question, entry.answer, score))
 
     matches.sort(key=lambda item: item.score, reverse=True)
     return matches[:limit]
@@ -184,9 +253,9 @@ def retrieve_ranked_answers(question: str, corpus_spec: str, limit: int = 3) -> 
 
 def retrieve_exact_answer(question: str, corpus_spec: str) -> str | None:
     q_norm = _normalize_query(question)
-    for candidate, answer in _load_corpus_examples(corpus_spec):
-        if q_norm == _normalize_query(candidate):
-            return answer
+    for entry in _load_corpus_examples(corpus_spec):
+        if q_norm == entry.normalized_question:
+            return entry.answer
     return None
 
 
@@ -217,7 +286,7 @@ def contextual_fallback_answer(
             "remember", "remind", "constraint", "priority", "preferred tone",
             "what did i", "which database", "what should we", "where should",
         ),
-    )
+    ) or _contains_any(question, ("记住", "提醒", "限制", "优先级", "刚才", "之前", "我说过", "语气"))
     if not wants_memory:
         return None
 
@@ -230,6 +299,11 @@ def contextual_fallback_answer(
         r"the user's preferred tone is\s*(.+)",
         r"the bug appears only\s*(.+)",
         r"the customer asked for\s*(.+)",
+        r"记住(?:这个|一点|：|:)?\s*(.+)",
+        r"请记住(?:这个|一点|：|:)?\s*(.+)",
+        r"限制是\s*(.+)",
+        r"优先级是\s*(.+)",
+        r"语气(?:要|是)\s*(.+)",
         r"(.+?)\s+uses\s+(.+?,\s+not\s+.+)",
         r"(.+?)\s+is on\s+(.+)",
     )
@@ -252,6 +326,14 @@ def contextual_fallback_answer(
                 return f"Use the earlier preferred tone: {fact}."
             if "where" in lower and "retry" in source.lower():
                 return f"Focus on the earlier detail: {fact}."
+            if _is_zh(question):
+                if "优先" in question:
+                    return f"之前的优先级是：{fact}。"
+                if "限制" in question:
+                    return f"之前提到的限制是：{fact}。"
+                if "语气" in question:
+                    return f"之前希望的语气是：{fact}。"
+                return f"你之前让我记住：{fact}。"
             return f"You asked me to remember: {fact}."
     return None
 
@@ -426,8 +508,8 @@ def is_low_quality_answer(answer: str, question: str) -> bool:
 
 
 def get_bad_token_ids(tokenizer, vocab_size: int, device: torch.device) -> torch.Tensor:
-    cache_name = "_gravity_bad_token_ids"
-    cached = getattr(tokenizer, cache_name, None)
+    cache_key = (id(tokenizer), vocab_size)
+    cached = _BAD_TOKEN_CACHE.get(cache_key)
     if cached is not None:
         return cached.to(device)
 
@@ -452,7 +534,7 @@ def get_bad_token_ids(tokenizer, vocab_size: int, device: torch.device) -> torch
                 bad_ids.append(token_id)
 
     tensor = torch.tensor(bad_ids, dtype=torch.long)
-    setattr(tokenizer, cache_name, tensor)
+    _BAD_TOKEN_CACHE[cache_key] = tensor
     return tensor.to(device)
 
 
@@ -470,7 +552,7 @@ def _entropy_from_logits(logits: torch.Tensor) -> float:
     return float(entropy.item())
 
 
-@torch.no_grad()
+@_inference_mode()
 def generate(
     model: MiniGPT,
     tokenizer,
@@ -479,11 +561,15 @@ def generate(
     temperature: float = 0.35,
     top_k: int | None = 30,
     top_p: float | None = 0.85,
-    device: torch.device = torch.device("cpu"),
+    device=None,
     stop_on_eos: bool = True,
     suppress_bad_tokens: bool = True,
     repetition_penalty: float = 1.08,
-) -> tuple[str, int, float, float]:
+) -> tuple[str, int, float, float, float]:
+    if torch is None:
+        raise RuntimeError("Model generation requires torch. Install requirements.txt or use --retrieval_only.") from _TORCH_IMPORT_ERROR
+    if device is None:
+        device = torch.device("cpu")
     model.eval()
     ids = tokenizer.encode(prompt)
     if not ids:
@@ -501,6 +587,7 @@ def generate(
     generated_ids = ids[:]
     entropy_total = 0.0
     entropy_count = 0
+    first_token_elapsed = 0.0
 
     for _ in range(max_new_tokens):
         next_logits = logits[:, -1, :].clone()
@@ -532,6 +619,10 @@ def generate(
         entropy_count += 1
         probs = torch.softmax(next_logits, dim=-1)
         next_id = torch.multinomial(probs, num_samples=1)
+        if entropy_count == 1:
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            first_token_elapsed = time.time() - start_time
         token_id = int(next_id.item())
         generated_ids.append(token_id)
 
@@ -547,7 +638,7 @@ def generate(
     elapsed = time.time() - start_time
     num_new_tokens = len(generated_ids) - len(ids)
     mean_entropy = entropy_total / max(1, entropy_count)
-    return tokenizer.decode(generated_ids, skip_special=False), num_new_tokens, elapsed, mean_entropy
+    return tokenizer.decode(generated_ids, skip_special=False), num_new_tokens, elapsed, mean_entropy, first_token_elapsed
 
 
 def build_qa_prompt(
@@ -590,7 +681,36 @@ def extract_answer(prompt: str, generated: str) -> str:
     return answer.strip()
 
 
-def load_model(checkpoint_path: str, tokenizer_path: str, device: torch.device) -> tuple[MiniGPT, object]:
+def apply_dynamic_quantization(model: MiniGPT, device: torch.device) -> MiniGPT:
+    if torch is None:
+        raise RuntimeError("Dynamic quantization requires torch to be installed.") from _TORCH_IMPORT_ERROR
+    if device.type != "cpu":
+        print("[Generate] Dynamic quantization is only applied on CPU; continuing unquantized.")
+        return model
+    try:
+        quantized = torch.ao.quantization.quantize_dynamic(
+            model,
+            {torch.nn.Linear},
+            dtype=torch.qint8,
+        )
+    except Exception as exc:
+        print(f"[Generate] Dynamic quantization failed; continuing unquantized: {exc}")
+        return model
+    print("[Generate] Dynamic int8 quantization enabled for Linear layers.")
+    return quantized
+
+
+def load_model(
+    checkpoint_path: str,
+    tokenizer_path: str,
+    device: torch.device,
+    dynamic_quantization: bool = False,
+) -> tuple[MiniGPT, object]:
+    if torch is None or _MODEL_IMPORT_ERROR is not None:
+        raise RuntimeError(
+            "Loading a Gravity checkpoint requires torch. Install requirements.txt "
+            "or run with --retrieval_only."
+        ) from (_MODEL_IMPORT_ERROR or _TORCH_IMPORT_ERROR)
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(
             f"Checkpoint not found: {checkpoint_path}. Train a model first or pass "
@@ -622,7 +742,84 @@ def load_model(checkpoint_path: str, tokenizer_path: str, device: torch.device) 
 
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
+    if dynamic_quantization:
+        model = apply_dynamic_quantization(model, device)
     return model, tokenizer
+
+
+def answer_question_result(
+    model: MiniGPT,
+    tokenizer,
+    question: str,
+    history: list[tuple[str, str]] | None,
+    max_new_tokens: int,
+    temperature: float,
+    top_k: int | None,
+    top_p: float | None,
+    device: torch.device,
+    suppress_bad_tokens: bool = True,
+    fallback_corpus: str | None = DEFAULT_FALLBACK_CORPUS,
+    use_retrieval_fallback: bool = True,
+    hallucination_entropy: float = 4.0,
+    max_prompt_tokens: int | None = None,
+) -> AnswerResult:
+    if use_retrieval_fallback and fallback_corpus:
+        exact_answer = retrieve_exact_answer(question, fallback_corpus)
+        if exact_answer:
+            return AnswerResult(exact_answer, 0, 0.0, "retrieval_exact")
+
+    prompt_budget = max_prompt_tokens
+    if prompt_budget is None:
+        prompt_budget = max(1, model.max_seq_len - max_new_tokens - 1)
+    prompt = build_qa_prompt(history or [], question, tokenizer, prompt_budget)
+    generated, num_tokens, elapsed, entropy, first_token_elapsed = generate(
+        model=model,
+        tokenizer=tokenizer,
+        prompt=prompt,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        top_k=top_k,
+        top_p=top_p,
+        device=device,
+        stop_on_eos=True,
+        suppress_bad_tokens=suppress_bad_tokens,
+    )
+    answer = extract_answer(prompt, generated)
+    if answer and entropy <= hallucination_entropy and not is_low_quality_answer(answer, question):
+        return AnswerResult(answer, num_tokens, elapsed, f"model:first_token={first_token_elapsed:.3f}s")
+
+    retry_generated, retry_tokens, retry_elapsed, retry_entropy, retry_first_token_elapsed = generate(
+        model=model,
+        tokenizer=tokenizer,
+        prompt=prompt,
+        max_new_tokens=max_new_tokens,
+        temperature=min(temperature, 0.18),
+        top_k=min(top_k, 16) if top_k is not None else 16,
+        top_p=min(top_p, 0.72) if top_p is not None else 0.72,
+        device=device,
+        stop_on_eos=True,
+        suppress_bad_tokens=True,
+        repetition_penalty=1.12,
+    )
+    retry_answer = extract_answer(prompt, retry_generated)
+    if retry_answer and retry_entropy <= hallucination_entropy and not is_low_quality_answer(retry_answer, question):
+        return AnswerResult(retry_answer, retry_tokens, retry_elapsed, f"model_retry:first_token={retry_first_token_elapsed:.3f}s")
+
+    contextual = contextual_fallback_answer(question, history)
+    if contextual:
+        return AnswerResult(contextual, retry_tokens, retry_elapsed, "fallback_context")
+
+    if fallback_corpus:
+        adaptive_corpus = fallback_corpus if use_retrieval_fallback else None
+        adaptive = adaptive_fallback_answer(question, history, adaptive_corpus)
+        if adaptive and not is_low_quality_answer(adaptive, question):
+            return AnswerResult(adaptive, retry_tokens, retry_elapsed, "fallback_intent")
+    if use_retrieval_fallback and fallback_corpus:
+        retrieved = retrieve_answer(question, fallback_corpus)
+        if retrieved:
+            return AnswerResult(retrieved, retry_tokens, retry_elapsed, "retrieval_ranked")
+
+    return AnswerResult(fallback_answer(question), retry_tokens, retry_elapsed, "fallback_generic")
 
 
 def answer_question(
@@ -641,67 +838,56 @@ def answer_question(
     hallucination_entropy: float = 4.0,
     max_prompt_tokens: int | None = None,
 ) -> tuple[str, int, float]:
-    if use_retrieval_fallback and fallback_corpus:
-        exact_answer = retrieve_exact_answer(question, fallback_corpus)
-        if exact_answer:
-            return exact_answer, 0, 0.0
-
-    prompt_budget = max_prompt_tokens
-    if prompt_budget is None:
-        prompt_budget = max(1, model.max_seq_len - max_new_tokens - 1)
-    prompt = build_qa_prompt(history or [], question, tokenizer, prompt_budget)
-    generated, num_tokens, elapsed, entropy = generate(
+    result = answer_question_result(
         model=model,
         tokenizer=tokenizer,
-        prompt=prompt,
+        question=question,
+        history=history,
         max_new_tokens=max_new_tokens,
         temperature=temperature,
         top_k=top_k,
         top_p=top_p,
         device=device,
-        stop_on_eos=True,
         suppress_bad_tokens=suppress_bad_tokens,
+        fallback_corpus=fallback_corpus,
+        use_retrieval_fallback=use_retrieval_fallback,
+        hallucination_entropy=hallucination_entropy,
+        max_prompt_tokens=max_prompt_tokens,
     )
-    answer = extract_answer(prompt, generated)
-    if answer and entropy <= hallucination_entropy and not is_low_quality_answer(answer, question):
-        return answer, num_tokens, elapsed
+    return result.answer, result.num_tokens, result.elapsed
 
-    retry_generated, retry_tokens, retry_elapsed, retry_entropy = generate(
-        model=model,
-        tokenizer=tokenizer,
-        prompt=prompt,
-        max_new_tokens=max_new_tokens,
-        temperature=min(temperature, 0.18),
-        top_k=min(top_k, 16) if top_k is not None else 16,
-        top_p=min(top_p, 0.72) if top_p is not None else 0.72,
-        device=device,
-        stop_on_eos=True,
-        suppress_bad_tokens=True,
-        repetition_penalty=1.12,
-    )
-    retry_answer = extract_answer(prompt, retry_generated)
-    if retry_answer and retry_entropy <= hallucination_entropy and not is_low_quality_answer(retry_answer, question):
-        return retry_answer, retry_tokens, retry_elapsed
+
+def answer_retrieval_only(
+    question: str,
+    history: list[tuple[str, str]] | None = None,
+    fallback_corpus: str | None = DEFAULT_FALLBACK_CORPUS,
+    use_retrieval_fallback: bool = True,
+) -> AnswerResult:
+    start_time = time.time()
+    if use_retrieval_fallback and fallback_corpus:
+        exact_answer = retrieve_exact_answer(question, fallback_corpus)
+        if exact_answer:
+            return AnswerResult(exact_answer, 0, time.time() - start_time, "retrieval_only_exact")
 
     contextual = contextual_fallback_answer(question, history)
     if contextual:
-        return contextual, retry_tokens, retry_elapsed
+        return AnswerResult(contextual, 0, time.time() - start_time, "retrieval_only_context")
 
-    if fallback_corpus:
-        adaptive_corpus = fallback_corpus if use_retrieval_fallback else None
-        adaptive = adaptive_fallback_answer(question, history, adaptive_corpus)
-        if adaptive and not is_low_quality_answer(adaptive, question):
-            return adaptive, retry_tokens, retry_elapsed
+    adaptive_corpus = fallback_corpus if use_retrieval_fallback else None
+    adaptive = adaptive_fallback_answer(question, history, adaptive_corpus)
+    if adaptive and not is_low_quality_answer(adaptive, question):
+        return AnswerResult(adaptive, 0, time.time() - start_time, "retrieval_only_intent")
+
     if use_retrieval_fallback and fallback_corpus:
         retrieved = retrieve_answer(question, fallback_corpus)
         if retrieved:
-            return retrieved, retry_tokens, retry_elapsed
+            return AnswerResult(retrieved, 0, time.time() - start_time, "retrieval_only_ranked")
 
-    return fallback_answer(question), retry_tokens, retry_elapsed
+    return AnswerResult(fallback_answer(question), 0, time.time() - start_time, "retrieval_only_generic")
 
 
 def chat_loop(
-    model: MiniGPT,
+    model: MiniGPT | None,
     tokenizer,
     max_new_tokens: int,
     temperature: float,
@@ -713,8 +899,10 @@ def chat_loop(
     fallback_corpus: str | None = DEFAULT_FALLBACK_CORPUS,
     use_retrieval_fallback: bool = True,
     max_prompt_tokens: int | None = None,
+    retrieval_only: bool = False,
 ) -> None:
-    print("Gravity Q/A chat mode. Type /exit to quit.")
+    mode = "retrieval-only" if retrieval_only else "model"
+    print(f"Gravity Q/A chat mode ({mode}). Type /exit to quit.")
     history: list[tuple[str, str]] = []
 
     while True:
@@ -730,25 +918,34 @@ def chat_loop(
             break
 
         prompt_history = history[-max_history:] if max_history > 0 else []
-        answer, num_tokens, elapsed = answer_question(
-            model=model,
-            tokenizer=tokenizer,
-            question=question,
-            history=prompt_history,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            top_k=top_k,
-            top_p=top_p,
-            device=device,
-            suppress_bad_tokens=suppress_bad_tokens,
-            fallback_corpus=fallback_corpus,
-            use_retrieval_fallback=use_retrieval_fallback,
-            max_prompt_tokens=max_prompt_tokens,
-        )
-        print(f"A: {answer}")
-        speed = num_tokens / elapsed if elapsed > 0 else 0.0
-        print(f"[Generated {num_tokens} tokens in {elapsed:.2f}s ({speed:.2f} tokens/s)]")
-        history.append((question, answer))
+        if retrieval_only:
+            result = answer_retrieval_only(
+                question=question,
+                history=prompt_history,
+                fallback_corpus=fallback_corpus,
+                use_retrieval_fallback=use_retrieval_fallback,
+            )
+        else:
+            if model is None or tokenizer is None:
+                raise RuntimeError("Model chat requested without a loaded model/tokenizer.")
+            result = answer_question_result(
+                model=model,
+                tokenizer=tokenizer,
+                question=question,
+                history=prompt_history,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                device=device,
+                suppress_bad_tokens=suppress_bad_tokens,
+                fallback_corpus=fallback_corpus,
+                use_retrieval_fallback=use_retrieval_fallback,
+                max_prompt_tokens=max_prompt_tokens,
+            )
+        print(f"A: {result.answer}")
+        _print_speed(result.num_tokens, result.elapsed, result.source)
+        history.append((question, result.answer))
 
 
 def parse_args() -> argparse.Namespace:
@@ -792,23 +989,77 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable corpus retrieval fallback and return only model text.",
     )
+    parser.add_argument(
+        "--retrieval_only",
+        action="store_true",
+        help="Answer from exact/retrieval/intent fallback without loading model weights.",
+    )
+    parser.add_argument(
+        "--strict_checkpoint",
+        action="store_true",
+        help="Fail if checkpoint/tokenizer loading fails instead of falling back to retrieval-only mode.",
+    )
+    parser.add_argument(
+        "--cpu_threads",
+        type=int,
+        default=None,
+        help="Set PyTorch CPU inference threads when torch is available.",
+    )
+    parser.add_argument(
+        "--dynamic_quantization",
+        action="store_true",
+        help="Apply CPU dynamic int8 quantization to Linear layers after loading a checkpoint.",
+    )
     return parser.parse_args()
 
 
-def _print_speed(num_tokens: int, elapsed: float) -> None:
+def _print_speed(num_tokens: int, elapsed: float, source: str | None = None) -> None:
     speed = num_tokens / elapsed if elapsed > 0 else 0.0
+    source_text = f" source={source}" if source else ""
     if math.isfinite(speed):
-        print(f"[Generated {num_tokens} tokens in {elapsed:.2f}s ({speed:.2f} tokens/s)]")
+        print(f"[Generated {num_tokens} tokens in {elapsed:.2f}s ({speed:.2f} tokens/s){source_text}]")
 
 
 def main() -> None:
     args = parse_args()
     tokenizer_path = args.vocab or args.tokenizer
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch is not None and args.cpu_threads is not None:
+        torch.set_num_threads(max(1, args.cpu_threads))
+        print(f"[Generate] CPU threads: {torch.get_num_threads()}")
+
+    if torch is None:
+        device = None
+        if not args.retrieval_only:
+            if args.strict_checkpoint:
+                raise RuntimeError(
+                    "torch is not installed, so checkpoint inference is unavailable."
+                ) from _TORCH_IMPORT_ERROR
+            print("[Generate] torch is unavailable; using retrieval-only mode.")
+            args.retrieval_only = True
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[Generate] Using device: {device}")
 
-    model, tokenizer = load_model(args.checkpoint, tokenizer_path, device)
-    print(f"[Generate] Loaded checkpoint from '{args.checkpoint}'.")
+    model = None
+    tokenizer = None
+    if not args.retrieval_only:
+        try:
+            model, tokenizer = load_model(
+                args.checkpoint,
+                tokenizer_path,
+                device,
+                dynamic_quantization=args.dynamic_quantization,
+            )
+            print(f"[Generate] Loaded checkpoint from '{args.checkpoint}'.")
+        except (FileNotFoundError, RuntimeError, ValueError) as exc:
+            if args.strict_checkpoint:
+                raise
+            print(f"[Generate] {exc}")
+            print("[Generate] Falling back to retrieval-only mode.")
+            args.retrieval_only = True
+
+    if args.retrieval_only:
+        _load_corpus_examples(args.fallback_corpus)
 
     suppress_bad_tokens = args.suppress_bad_tokens and not args.allow_bad_tokens
     if args.chat:
@@ -825,30 +1076,50 @@ def main() -> None:
             fallback_corpus=args.fallback_corpus,
             use_retrieval_fallback=not args.no_retrieval_fallback,
             max_prompt_tokens=args.max_prompt_tokens,
+            retrieval_only=args.retrieval_only,
         )
         return
 
     if args.ask is not None:
-        answer, num_tokens, elapsed = answer_question(
-            model=model,
-            tokenizer=tokenizer,
-            question=args.ask,
-            history=[],
-            max_new_tokens=args.max_new_tokens,
-            temperature=args.temperature,
-            top_k=args.top_k,
-            top_p=args.top_p,
-            device=device,
-            suppress_bad_tokens=suppress_bad_tokens,
-            fallback_corpus=args.fallback_corpus,
-            use_retrieval_fallback=not args.no_retrieval_fallback,
-            max_prompt_tokens=args.max_prompt_tokens,
-        )
-        print(answer)
-        _print_speed(num_tokens, elapsed)
+        if args.retrieval_only:
+            result = answer_retrieval_only(
+                question=args.ask,
+                history=[],
+                fallback_corpus=args.fallback_corpus,
+                use_retrieval_fallback=not args.no_retrieval_fallback,
+            )
+        else:
+            result = answer_question_result(
+                model=model,
+                tokenizer=tokenizer,
+                question=args.ask,
+                history=[],
+                max_new_tokens=args.max_new_tokens,
+                temperature=args.temperature,
+                top_k=args.top_k,
+                top_p=args.top_p,
+                device=device,
+                suppress_bad_tokens=suppress_bad_tokens,
+                fallback_corpus=args.fallback_corpus,
+                use_retrieval_fallback=not args.no_retrieval_fallback,
+                max_prompt_tokens=args.max_prompt_tokens,
+            )
+        print(result.answer)
+        _print_speed(result.num_tokens, result.elapsed, result.source)
         return
 
-    output, num_tokens, elapsed, _ = generate(
+    if args.retrieval_only:
+        result = answer_retrieval_only(
+            question=args.prompt,
+            history=[],
+            fallback_corpus=args.fallback_corpus,
+            use_retrieval_fallback=not args.no_retrieval_fallback,
+        )
+        print(result.answer)
+        _print_speed(result.num_tokens, result.elapsed, result.source)
+        return
+
+    output, num_tokens, elapsed, _, first_token_elapsed = generate(
         model=model,
         tokenizer=tokenizer,
         prompt=args.prompt,
@@ -861,7 +1132,7 @@ def main() -> None:
         suppress_bad_tokens=suppress_bad_tokens,
     )
     print(output)
-    _print_speed(num_tokens, elapsed)
+    _print_speed(num_tokens, elapsed, f"model:first_token={first_token_elapsed:.3f}s")
 
 
 if __name__ == "__main__":

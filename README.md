@@ -6,6 +6,30 @@ full multi-head self-attention, KV cache generation, tied embeddings, mixed
 precision training, and answer-only supervised loss. Smaller GQA presets and
 legacy LayerNorm + fused-MHA checkpoints are still loadable.
 
+## Windows CPU Quick Start
+
+This workspace can still answer from the curated corpus when no checkpoint or
+PyTorch install is available:
+
+```powershell
+python generate.py --ask "在吗" --retrieval_only
+python generate.py --chat --retrieval_only
+```
+
+If `python` is not on `PATH`, use a known Python executable and install the
+runtime dependencies first:
+
+```powershell
+python -m pip install -r requirements.txt
+$env:PYTHONPYCACHEPREFIX="$env:TEMP\gravity_pycache"
+python -m py_compile model.py generate.py train.py train_dpo.py eval_prompts.py eval_dialogues.py utils.py tokenizer.py
+python validate_corpus.py
+```
+
+By default, `generate.py` falls back to retrieval-only mode when checkpoint
+loading is impossible. Add `--strict_checkpoint` when you want missing weights,
+tokenizers, or PyTorch to fail loudly.
+
 ## Corpus
 
 Build and validate the main corpus:
@@ -49,6 +73,20 @@ Repeat this loop in small steps: generate candidates, let DeepSeek judge, run a
 short DPO pass, evaluate, then continue from the new checkpoint. Use
 `--mode manual` for human scoring or `--mode heuristic` for an offline bootstrap
 pass when no API key is available.
+
+For CPU-first self-training, keep the order simple and incremental:
+
+```powershell
+python validate_corpus.py
+python train.py --model_preset gravity-30m --checkpoint_dir checkpoints_cpu_30m --batch_size 1 --grad_accum_steps 8 --max_iters 500 --device cpu --no_progress
+python eval_prompts.py --checkpoint checkpoints_cpu_30m/model.pt --tokenizer checkpoints_cpu_30m/tokenizer.json
+python eval_dialogues.py --checkpoint checkpoints_cpu_30m/model.pt --tokenizer checkpoints_cpu_30m/tokenizer.json
+python generate_candidates.py --checkpoint checkpoints_cpu_30m/model.pt --tokenizer checkpoints_cpu_30m/tokenizer.json --max_prompts 200 --num_candidates 2 --output preference_candidates_cpu.jsonl
+python score_preferences.py --input preference_candidates_cpu.jsonl --output preferences_cpu.jsonl --mode heuristic --domain casual
+python train_dpo.py --preferences preferences_cpu.jsonl --checkpoint checkpoints_cpu_30m/model.pt --tokenizer checkpoints_cpu_30m/tokenizer.json --checkpoint_dir checkpoints_cpu_30m_dpo --max_iters 20 --batch_size 1 --reference_free --device cpu
+```
+
+Use `gravity-60m` for the next quality tier when CPU time and memory allow it.
 
 ## Online Reinforcement Learning
 
@@ -107,8 +145,8 @@ Available presets:
 
 - `tiny`: quick CPU smoke tests
 - `small`: old small-model scale
-- `gravity-30m`: low-cost tiktoken training
-- `gravity-60m`: mid-size training target
+- `gravity-30m`: recommended CPU starting point for self-training
+- `gravity-60m`: CPU quality tier when you can spend more time and memory
 - `gravity-120m`: compatibility 120M architecture with GQA
 - `gravity-120m-long`: 120M GQA layout with NTK-style RoPE scaling for longer
   context fine-tuning
@@ -206,5 +244,16 @@ requests are reshaped instead of blindly copying the nearest corpus row.
 For pure model debugging:
 
 ```bash
-python generate.py --checkpoint checkpoints_gravity120/model.pt --tokenizer checkpoints_gravity120/tokenizer.json --ask "在吗" --no_retrieval_fallback
+python generate.py --checkpoint checkpoints_gravity120/model.pt --tokenizer checkpoints_gravity120/tokenizer.json --ask "在吗" --no_retrieval_fallback --strict_checkpoint
 ```
+
+CPU inference options:
+
+```bash
+python generate.py --checkpoint checkpoints_cpu_30m/model.pt --tokenizer checkpoints_cpu_30m/tokenizer.json --ask "在吗" --cpu_threads 4
+python generate.py --checkpoint checkpoints_cpu_30m/model.pt --tokenizer checkpoints_cpu_30m/tokenizer.json --ask "在吗" --dynamic_quantization
+```
+
+`--dynamic_quantization` applies int8 dynamic quantization to Linear layers on
+CPU. Compare the printed `source=...first_token=...` and tokens/s metrics with
+and without the flag before making it your default for a checkpoint.
