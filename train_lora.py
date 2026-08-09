@@ -38,10 +38,10 @@ def parse_args() -> argparse.Namespace:
                         choices=["auto", "cuda", "rocm", "cpu"],
                         help="auto 优先 CUDA，其次 ROCm (AMD)，最后 CPU (fp32)。")
     parser.add_argument("--model_dir", type=str,
-                        default="hf_models/qwen3-0.6b")
+                        default="hf_models/qwen35-2b")
     parser.add_argument("--data_dir", type=str, default="sft_data")
     parser.add_argument("--out_dir", type=str,
-                        default="checkpoints_lora/qwen3-06b-gravity")
+                        default="checkpoints_lora/qwen35-2b-gravity")
     parser.add_argument("--seq_len", type=int, default=1024)
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--micro_batch", type=int, default=4)
