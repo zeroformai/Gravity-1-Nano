@@ -12,8 +12,10 @@ Provides:
 
 from __future__ import annotations
 import glob
+import inspect
 import re
 import torch
+import torch.nn.functional as F
 import random
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -42,6 +44,231 @@ def get_grad_scaler(device_type: str, enabled: bool = False):
     if hasattr(torch, "cuda") and hasattr(torch.cuda, "amp"):
         return torch.cuda.amp.GradScaler(enabled=use_cuda_amp)
     return _DisabledGradScaler()
+
+
+def configure_cuda_training(device: torch.device) -> None:
+    """Enable CUDA math fast paths that preserve existing training semantics."""
+    if device.type != "cuda":
+        return
+    torch.set_float32_matmul_precision("high")
+    if hasattr(torch.backends, "cuda"):
+        torch.backends.cuda.matmul.allow_tf32 = True
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.allow_tf32 = True
+
+
+def select_device(requested: str) -> torch.device:
+    """Resolve a CLI device option to a torch device.
+
+    支持 CUDA (NVIDIA)、ROCm (AMD)、CPU。auto 按可用性探测：
+    CUDA 优先，其次 ROCm，最后 CPU。
+    """
+    if requested == "cpu":
+        return torch.device("cpu")
+    if requested == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("--device cuda requested but CUDA is not available.")
+        return torch.device("cuda")
+    if requested == "rocm":
+        if not _rocm_available():
+            raise RuntimeError("--device rocm requested but ROCm is not available.")
+        return torch.device("rocm")
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if _rocm_available():
+        return torch.device("rocm")
+    return torch.device("cpu")
+
+
+def _rocm_available() -> bool:
+    """ROCm (AMD GPU) 是否可用：torch.hip.is_available() 或 hip 后端的 cuda 兼容层。"""
+    hip = getattr(torch, "hip", None)
+    if hip is not None:
+        try:
+            return bool(hip.is_available())
+        except Exception:
+            return False
+    return False
+
+
+def create_adamw(
+    param_groups: list[dict],
+    lr: float,
+    betas: tuple[float, float],
+    eps: float = 1e-8,
+    device_type: str = "cpu",
+) -> tuple[torch.optim.Optimizer, bool]:
+    """Create AdamW and use the fused CUDA implementation when available."""
+    kwargs = {
+        "lr": lr,
+        "betas": betas,
+        "eps": eps,
+    }
+    use_fused = False
+    try:
+        sig = inspect.signature(torch.optim.AdamW)
+        use_fused = "fused" in sig.parameters and device_type == "cuda"
+    except (TypeError, ValueError):
+        use_fused = False
+    if use_fused:
+        kwargs["fused"] = True
+    return torch.optim.AdamW(param_groups, **kwargs), use_fused
+
+
+def maybe_compile_model(model: torch.nn.Module, enabled: bool, label: str) -> torch.nn.Module:
+    """Compile a model when requested and available."""
+    if not enabled:
+        return model
+    if hasattr(torch, "compile"):
+        print(f"[{label}] torch.compile: enabled")
+        return torch.compile(model)
+    print(f"[{label}] torch.compile requested but unavailable; continuing uncompiled.")
+    return model
+
+
+def unwrap_compiled_model(model: torch.nn.Module) -> torch.nn.Module:
+    """Return the original module behind torch.compile wrappers."""
+    return model._orig_mod if hasattr(model, "_orig_mod") else model
+
+
+def model_state_dict(model: torch.nn.Module) -> dict:
+    """Return a checkpoint-compatible state dict for compiled or eager models."""
+    return unwrap_compiled_model(model).state_dict()
+
+
+def filter_top_k_top_p(
+    logits: torch.Tensor,
+    top_k: int | None,
+    top_p: float | None,
+) -> torch.Tensor:
+    """Apply top-k and nucleus filtering to logits."""
+    if top_k is not None:
+        k = min(top_k, logits.size(-1))
+        values, _ = torch.topk(logits, k)
+        logits = logits.masked_fill(logits < values[:, -1].unsqueeze(-1), float("-inf"))
+
+    if top_p is not None and top_p < 1.0:
+        sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+        cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+        sorted_indices_to_remove = cumulative_probs > top_p
+        sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
+        sorted_indices_to_remove[:, 0] = False
+        indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+        logits = logits.masked_fill(indices_to_remove, float("-inf"))
+    return logits
+
+
+def contains_any(text: str, needles: tuple[str, ...]) -> bool:
+    """Case-insensitive substring check for a group of keywords."""
+    lowered = text.lower()
+    return any(needle.lower() in lowered for needle in needles)
+
+
+def lexical_features(
+    text: str,
+    en_stop_words: set[str] | None = None,
+    zh_stop_chars: set[str] | None = None,
+    include_cjk_chars: bool = False,
+) -> set[str]:
+    """Return word and CJK n-gram features for lightweight lexical matching."""
+    normalized = re.sub(r"\s+", " ", text.lower()).strip()
+    stop_words = en_stop_words or set()
+    stop_chars = zh_stop_chars or set()
+    words = {
+        word
+        for word in re.findall(r"[a-z0-9']+", normalized)
+        if len(word) > 1 and word not in stop_words
+    }
+    for segment in re.findall(r"[\u4e00-\u9fff]+", normalized):
+        if include_cjk_chars:
+            words.update(ch for ch in segment if ch not in stop_chars)
+        for size in (2, 3):
+            words.update(segment[i:i + size] for i in range(max(0, len(segment) - size + 1)))
+    return words
+
+
+def masked_cross_entropy(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    ignore_index: int = -100,
+    label_smoothing: float = 0.0,
+) -> torch.Tensor:
+    """Cross entropy over valid target positions only."""
+    vocab_size = logits.size(-1)
+    flat_targets = targets.reshape(-1)
+    valid = flat_targets != ignore_index
+    if not bool(valid.any()):
+        return logits.sum() * 0.0
+    flat_logits = logits.reshape(-1, vocab_size)
+    return F.cross_entropy(
+        flat_logits[valid],
+        flat_targets[valid],
+        label_smoothing=label_smoothing,
+    )
+
+
+def masked_sequence_logps(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    loss_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Average log probability per sequence over masked token positions only."""
+    mask = loss_mask.to(dtype=torch.bool)
+    if not bool(mask.any()):
+        return logits.new_zeros(logits.size(0))
+
+    batch_size = logits.size(0)
+    row_ids = torch.arange(batch_size, device=logits.device).unsqueeze(1).expand_as(mask)
+    valid_rows = row_ids[mask]
+    valid_logits = logits[mask]
+    valid_targets = targets[mask]
+    valid_logps = F.log_softmax(valid_logits, dim=-1).gather(
+        -1,
+        valid_targets.unsqueeze(-1),
+    ).squeeze(-1)
+
+    seq_logps = logits.new_zeros(batch_size)
+    seq_logps.scatter_add_(0, valid_rows, valid_logps)
+    lengths = mask.sum(dim=-1).clamp_min(1)
+    return seq_logps / lengths
+
+
+def model_sequence_logps(
+    model: torch.nn.Module,
+    x: torch.Tensor,
+    y: torch.Tensor,
+    loss_mask: torch.Tensor,
+    use_amp: bool = False,
+) -> torch.Tensor:
+    """Forward a model and compute masked average sequence log-probabilities."""
+    with get_autocast(x.device.type, enabled=use_amp):
+        logits, _ = model(x)
+        return masked_sequence_logps(logits, y, loss_mask)
+
+
+def pad_token_sequences_with_loss_mask(
+    sequences: list[list[int]],
+    loss_masks: list[list[int]],
+    pad_id: int,
+    device: torch.device,
+    max_sequence_len: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pad token-id sequences and matching loss masks for next-token scoring."""
+    max_len = max_sequence_len or max(len(ids) for ids in sequences)
+    input_len = max_len - 1
+    batch = len(sequences)
+    x = torch.full((batch, input_len), pad_id, dtype=torch.long)
+    y = torch.full((batch, input_len), pad_id, dtype=torch.long)
+    mask = torch.zeros((batch, input_len), dtype=torch.bool)
+
+    for row, ids in enumerate(sequences):
+        source = ids[:-1]
+        target = ids[1:]
+        length = len(source)
+        x[row, :length] = torch.tensor(source, dtype=torch.long)
+        y[row, :length] = torch.tensor(target, dtype=torch.long)
+        mask[row, :len(loss_masks[row])] = torch.tensor(loss_masks[row], dtype=torch.bool)
+    return x.to(device), y.to(device), mask.to(device)
 
 
 class _DisabledGradScaler:
@@ -209,6 +436,136 @@ def build_history_examples(
             examples.append(QAExample(question="\n".join(prompt_parts), answer=turn.answer))
     print(f"[Utils] Built {len(examples):,} history-aware dialogue examples.")
     return examples
+
+
+def _qa_language_key(example: QAExample) -> str:
+    text = f"{example.question} {example.answer}"
+    has_cjk = bool(re.search(r"[\u4e00-\u9fff]", text))
+    has_latin = bool(re.search(r"[A-Za-z]", text))
+    if has_cjk and has_latin:
+        return "mixed"
+    if has_cjk:
+        return "zh"
+    if has_latin:
+        return "en"
+    return "other"
+
+
+def _qa_stratify_key(example: QAExample) -> tuple[str, str]:
+    answer = re.sub(r"\s+", " ", example.answer.strip().lower())
+    return _qa_language_key(example), answer
+
+
+def _fractional_split_counts(
+    total: int,
+    val_fraction: float,
+    test_fraction: float,
+) -> tuple[int, int, int]:
+    test_count = int(round(total * test_fraction))
+    val_count = int(round(total * val_fraction))
+    if total > 1 and test_fraction > 0 and test_count == 0:
+        test_count = 1
+    if total > 2 and val_fraction > 0 and val_count == 0:
+        val_count = 1
+
+    while total - val_count - test_count < 1 and (val_count > 0 or test_count > 0):
+        if test_count >= val_count and test_count > 0:
+            test_count -= 1
+        elif val_count > 0:
+            val_count -= 1
+    train_count = total - val_count - test_count
+    return train_count, val_count, test_count
+
+
+def _split_shuffled_items(
+    items: list[QAExample],
+    val_fraction: float,
+    test_fraction: float,
+    rng: random.Random,
+) -> tuple[list[QAExample], list[QAExample], list[QAExample]]:
+    shuffled = list(items)
+    rng.shuffle(shuffled)
+    train_count, val_count, test_count = _fractional_split_counts(
+        len(shuffled),
+        val_fraction,
+        test_fraction,
+    )
+    test_examples = shuffled[:test_count]
+    val_examples = shuffled[test_count:test_count + val_count]
+    train_examples = shuffled[test_count + val_count:test_count + val_count + train_count]
+    return train_examples, val_examples, test_examples
+
+
+def split_qa_examples(
+    examples: list[QAExample],
+    val_fraction: float = 0.05,
+    test_fraction: float = 0.05,
+    seed: int = 42,
+    stratify: bool = True,
+    min_stratum_size: int = 10,
+) -> tuple[list[QAExample], list[QAExample], list[QAExample]]:
+    """Randomly split raw Q/A examples, stratifying repeated answer templates."""
+    if not examples:
+        raise ValueError("No Q/A examples available for splitting.")
+    if val_fraction < 0 or test_fraction < 0:
+        raise ValueError("Split fractions must be non-negative.")
+    if val_fraction + test_fraction >= 1.0:
+        raise ValueError("--val_frac + --test_frac must be less than 1.0.")
+
+    rng = random.Random(seed)
+    if not stratify:
+        train_examples, val_examples, test_examples = _split_shuffled_items(
+            examples,
+            val_fraction,
+            test_fraction,
+            rng,
+        )
+    else:
+        groups: dict[tuple[str, str], list[QAExample]] = {}
+        for example in examples:
+            groups.setdefault(_qa_stratify_key(example), []).append(example)
+
+        train_examples = []
+        val_examples = []
+        test_examples = []
+        residual_examples = []
+        group_items = list(groups.values())
+        rng.shuffle(group_items)
+        for group in group_items:
+            if len(group) < min_stratum_size:
+                residual_examples.extend(group)
+                continue
+            group_train, group_val, group_test = _split_shuffled_items(
+                group,
+                val_fraction,
+                test_fraction,
+                rng,
+            )
+            train_examples.extend(group_train)
+            val_examples.extend(group_val)
+            test_examples.extend(group_test)
+
+        if residual_examples:
+            residual_train, residual_val, residual_test = _split_shuffled_items(
+                residual_examples,
+                val_fraction,
+                test_fraction,
+                rng,
+            )
+            train_examples.extend(residual_train)
+            val_examples.extend(residual_val)
+            test_examples.extend(residual_test)
+
+        rng.shuffle(train_examples)
+        rng.shuffle(val_examples)
+        rng.shuffle(test_examples)
+
+    print(
+        f"[Utils] QA split: train {len(train_examples):,} | "
+        f"val {len(val_examples):,} | test {len(test_examples):,} "
+        f"(seed={seed}, stratify={stratify})"
+    )
+    return train_examples, val_examples, test_examples
 
 
 def encode_qa_examples(
@@ -420,10 +777,10 @@ def estimate_loss(
         losses = []
         for _ in range(eval_iters):
             x, y = get_batch(data, batch_size, seq_len, device)
-            with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+            with get_autocast(device.type, enabled=use_amp):
                 logits, _ = model(x)
                 # Flatten for cross-entropy: (B*T, vocab_size) vs (B*T,)
-                loss = torch.nn.functional.cross_entropy(
+                loss = F.cross_entropy(
                     logits.view(-1, logits.size(-1)), y.view(-1)
                 )
             losses.append(loss.item())
@@ -452,13 +809,9 @@ def estimate_qa_loss(
         losses = []
         for _ in range(eval_iters):
             x, y, mask = get_qa_batch(examples, batch_size, seq_len, device, pad_id)
-            with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+            with get_autocast(device.type, enabled=use_amp):
                 logits, _ = model(x, padding_mask=mask if use_padding_mask else None)
-                loss = torch.nn.functional.cross_entropy(
-                    logits.view(-1, logits.size(-1)),
-                    y.view(-1),
-                    ignore_index=-100,
-                )
+                loss = masked_cross_entropy(logits, y)
             losses.append(loss.item())
         out[split] = sum(losses) / len(losses)
     model.train()

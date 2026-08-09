@@ -1,7 +1,0 @@
-{
-  "kind": "tiktoken",
-  "encoding_name": "cl100k_base",
-  "eos_token": "<eos>",
-  "eos_id": 100277,
-  "vocab_size": 100278
-}

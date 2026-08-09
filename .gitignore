@@ -9,3 +9,10 @@ venv/
 env/
 *.log
 *.pt
+*.safetensors
+*.bin
+*.jsonl
+hf_models/
+checkpoints_lora/
+checkpoints*/
+sft_data/

@@ -15,11 +15,21 @@ from dataclasses import dataclass
 
 import torch
 
-from generate import answer_question, load_model
+from generate import answer_question, answer_roleplay_result, load_model
+from roleplay import RoleCard
 
 
 @dataclass(frozen=True)
 class ContextCase:
+    history: list[tuple[str, str]]
+    question: str
+    must_contain: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class RoleplayContextCase:
+    role: RoleCard
+    memories: list[str]
     history: list[tuple[str, str]]
     question: str
     must_contain: tuple[str, ...]
@@ -77,6 +87,33 @@ CONTEXT_CASES = [
 ]
 
 
+ROLEPLAY_CONTEXT_CASES = [
+    RoleplayContextCase(
+        role=RoleCard(
+            name="Luna",
+            persona="A gentle late-night companion who speaks softly and remembers small details.",
+            relationship="trusted companion",
+            facts=("The user likes being called star when they feel small.",),
+        ),
+        memories=["The user said presentations make them freeze.", "The user likes being called star."],
+        history=[("I feel tiny tonight.", "I am here, star. We can keep this small.")],
+        question="I have that presentation tomorrow and I feel tiny again.",
+        must_contain=("star",),
+    ),
+    RoleplayContextCase(
+        role=RoleCard(
+            name="Mira",
+            persona="A calm companion who keeps promises realistic and avoids therapist language.",
+            relationship="close friend",
+        ),
+        memories=["The user asked for no big advice unless they ask for it."],
+        history=[],
+        question="Please just sit with me. No advice yet.",
+        must_contain=("here",),
+    ),
+]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate context memory cases")
     parser.add_argument("--checkpoint", type=str, default="checkpoints_longctx_step2_context/model.pt")
@@ -87,6 +124,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top_k", type=int, default=16)
     parser.add_argument("--top_p", type=float, default=0.72)
     parser.add_argument("--max_prompt_tokens", type=int, default=900)
+    parser.add_argument("--include_roleplay_cases", action="store_true")
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     parser.add_argument("--fail_under", type=float, default=1.0)
     return parser.parse_args()
@@ -99,7 +137,17 @@ def select_device(requested: str) -> torch.device:
         if not torch.cuda.is_available():
             raise RuntimeError("--device cuda requested but CUDA is not available.")
         return torch.device("cuda")
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if requested == "rocm":
+        hip = getattr(torch, "hip", None)
+        if hip is None or not hip.is_available():
+            raise RuntimeError("--device rocm requested but ROCm is not available.")
+        return torch.device("rocm")
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    hip = getattr(torch, "hip", None)
+    if hip is not None and hip.is_available():
+        return torch.device("rocm")
+    return torch.device("cpu")
 
 
 def case_passes(answer: str, required: tuple[str, ...]) -> bool:
@@ -139,8 +187,33 @@ def main() -> None:
         print(f"A: {answer}")
         print(f"[Generated {num_tokens} tokens in {elapsed:.2f}s]")
 
-    accuracy = passed / len(CONTEXT_CASES)
-    print(f"[ContextEval] accuracy={accuracy:.3f} ({passed}/{len(CONTEXT_CASES)})")
+    if args.include_roleplay_cases:
+        for index, case in enumerate(ROLEPLAY_CONTEXT_CASES, start=1):
+            result = answer_roleplay_result(
+                model=model,
+                tokenizer=tokenizer,
+                role=case.role,
+                question=case.question,
+                history=case.history,
+                memories=case.memories,
+                max_new_tokens=args.max_new_tokens,
+                temperature=args.temperature,
+                top_k=args.top_k,
+                top_p=args.top_p,
+                device=device,
+                suppress_bad_tokens=True,
+                max_prompt_tokens=args.max_prompt_tokens,
+            )
+            ok = case_passes(result.answer, case.must_contain)
+            passed += int(ok)
+            status = "PASS" if ok else "FAIL"
+            print(f"[{status}] roleplay case {index}: {case.question}")
+            print(f"A: {result.answer}")
+            print(f"[Generated {result.num_tokens} tokens in {result.elapsed:.2f}s]")
+
+    total_cases = len(CONTEXT_CASES) + (len(ROLEPLAY_CONTEXT_CASES) if args.include_roleplay_cases else 0)
+    accuracy = passed / total_cases
+    print(f"[ContextEval] accuracy={accuracy:.3f} ({passed}/{total_cases})")
     if accuracy < args.fail_under:
         raise SystemExit(1)
 
